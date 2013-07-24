@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"database/sql"
+	"flag"
 	"fmt"
 	_ "github.com/bmizerany/pq"
 	"io/ioutil"
@@ -14,6 +15,8 @@ import (
 
 var (
 	scriptsFolder string = "./scripts"
+	cs            ConnectionString
+	help          bool
 )
 
 const (
@@ -59,15 +62,23 @@ func (c ConnectionString) String() string {
 	return buffer.String()
 }
 
-func main() {
-	cs := ConnectionString{
-		Host:    "/var/run/postgresql",
-		User:    "postgres",
-		DBName:  "b4b",
-		Port:    5432,
-		Options: "sslmode=disable",
-	}
+func init() {
+	flag.StringVar(&cs.DBName, "dbname", "postgres", "Name of the database to manage")
+	flag.StringVar(&cs.Host, "host", "/var/run/postgresql", "Address of the DB host.")
+	flag.StringVar(&cs.Options, "options", "sslmode=disable", "Extra options to pass to postgresql.")
+	flag.StringVar(&cs.Password, "password", "", "Password to use when connecting to the database.")
+	flag.StringVar(&cs.User, "user", "postgres", "User name to use when connecting to the database.")
+	flag.IntVar(&cs.Port, "port", 5432, "The port the host is listening on.")
+	flag.StringVar(&scriptsFolder, "path", "./", "The path containing the upgrade scripts.")
+	flag.BoolVar(&help, "help", false, "Shows this help message.")
+}
 
+func main() {
+	flag.Parse()
+	if help {
+		flag.Usage()
+		return
+	}
 	init, ver := initDb(cs)
 	if init {
 		log.Print("Initialization complete.")
@@ -95,26 +106,31 @@ func ExecuteUpgradeScript(cs ConnectionString, r chan Upgrade, s chan Upgrade) {
 				log.Print("Running: ", u.Script)
 
 				tx, err := db.Begin()
-				if err != nil {
-					log.Print(err)
-					log.Print("Upgrade failed on: ", u.Script)
-					close(s)
+
+				ex := func(e error) bool {
+					if e != nil {
+						log.Print(e)
+						log.Print("Upgrade failed on: ", u.Script)
+						if tx != nil {
+							tx.Rollback()
+						}
+						close(s)
+						return true
+					}
+					return false
+				}
+				if ex(err) {
 					return
 				}
-				if _, err := tx.Exec(versionInsert, u.Id, u.Script); err != nil {
-					tx.Rollback()
-					log.Print(err)
-					log.Print("Upgrade failed on: ", u.Script)
-					close(s)
+
+				if _, err = tx.Exec(versionInsert, u.Id, u.Script); ex(err) {
 					return
 				}
-				if _, err := tx.Exec(string(u.Content)); err != nil {
-					tx.Rollback()
-					log.Print(err)
-					log.Print("Upgrade failed on: ", u.Script)
-					close(s)
+
+				if _, err = tx.Exec(string(u.Content)); ex(err) {
 					return
 				}
+
 				tx.Commit()
 				s <- u
 			}
@@ -125,32 +141,35 @@ func ExecuteUpgradeScript(cs ConnectionString, r chan Upgrade, s chan Upgrade) {
 
 func GetUpgradeScripts(dir string, ver int, s chan Upgrade) {
 	go func() {
-		if files, err := ioutil.ReadDir(dir); err != nil {
-			log.Print(err)
+		ex := func(e error) bool {
+			if e != nil {
+				log.Print(e)
+				close(s)
+				return true
+			}
+			return false
+		}
+
+		if files, err := ioutil.ReadDir(dir); ex(err) {
 			return
 		} else {
 			re := regexp.MustCompile("^\\d+")
 			for _, f := range files {
 				if m := re.FindString(f.Name()); m != "" {
-					if v, err := strconv.Atoi(m); err != nil {
-						log.Print(err)
-						close(s)
+					if v, err := strconv.Atoi(m); ex(err) {
 						return
 					} else if v > ver {
 						log.Print("Preparing: ", f.Name())
-						b, err := ioutil.ReadFile(path.Join(dir, f.Name()))
-						if err != nil {
-							log.Print(err)
-							close(s)
+						if b, err := ioutil.ReadFile(path.Join(dir, f.Name())); ex(err) {
 							return
+						} else {
+							s <- Upgrade{Id: v, Script: f.Name(), Content: b}
 						}
-						s <- Upgrade{Id: v, Script: f.Name(), Content: b}
 					}
 				}
 			}
 			close(s)
 		}
-
 	}()
 }
 
